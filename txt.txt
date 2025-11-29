@@ -1,0 +1,77 @@
+1) Target architecture (modules & flows)
+
+Actors
+
+User (mobile Flutter)
+
+Home (aka “group”: e.g., your family apartment)
+
+Device (ESP32 unit)
+
+Service (Node.js API + WebSocket)
+
+Flows
+
+Auth (JWT)
+
+Email/phone + password (bcrypt) or OTP.
+
+Issue Access Token (short-lived) + Refresh Token (long-lived).
+
+All HTTP uses Authorization: Bearer <accessToken>.
+
+WebSocket handshake includes the JWT (query param or Sec-WebSocket-Protocol) and is verified server-side.
+
+Homes & Roles (RBAC)
+
+A user can belong to many homes with a role:
+
+owner (the creator),
+
+admin (e.g., father, mother),
+
+member (regular),
+
+guest (time-boxed).
+
+Owners/Admins can invite users to a home via invite code/link and assign role.
+
+Device access is scoped per home and optionally per device.
+
+Device identity & secure registration
+
+Each ESP32 has device_id and device_secret (printed on label or generated once).
+
+Device connects to WS /ws/device using { device_id, device_secret } to authenticate.
+
+After claim: device is bound to a home_id.
+
+Access control for commands
+
+To send a control command, API checks:
+
+user ∈ home, role’s permission or explicit policy grants access to that device,
+
+optional pin-level or capability scopes (e.g., allow only light on/off, not lock).
+
+Guests can have device allowlist + expires_at.
+
+Schedules & automations (smart)
+
+Store as RRule/cron + timezone (home-level tz).
+
+Use a job queue (e.g., BullMQ + Redis) or node-cron; avoid polling DB every 30s.
+
+Support scenes (multi-device actions), IFTTT-style automations (e.g., “if motion, then turn on light for 2 min”).
+
+Device shadow & offline queue
+
+Maintain device shadow state in DB/Redis.
+
+If device is offline, queue the last command (or N commands) with timeout + retry when it reconnects.
+
+Require ACK from ESP32; retry/backoff on no-ack.
+
+Observability & security
+
+.env config, structured logs, audit trails (CommandLog, AuthLog), rate limiting, CORS, input validation (zod/joi), heartbeat pings.
