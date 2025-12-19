@@ -123,6 +123,8 @@ async function getOverview(db, userId) {
  *   "autoLogin": true
  * }
  */
+const DEFAULT_ROOM_ICON = "assets/images/public.png";
+
 router.post("/register-with-home", async (req, res) => {
   // ---- 1) Normalize & validate inputs ----
   const raw = req.body || {};
