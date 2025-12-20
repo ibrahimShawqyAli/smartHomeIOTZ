@@ -38,7 +38,11 @@ async function ensureLogicalDevices(
   if (flags.has("I"))
     desired.push({ kind: "IR", pin: null, icon: "assets/images/ir.png" });
   if (flags.has("R"))
-    desired.push({ kind: "RGB", pin: null, icon: "assets/images/rgb.png" });
+    desired.push({
+      kind: "RGB",
+      pin: null,
+      icon: "assets/images/color wheel icon.png",
+    });
 
   const sortedPins = [...pins].sort((a, b) => a - b);
   sortedPins.forEach((p, i) =>
