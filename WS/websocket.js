@@ -41,7 +41,7 @@ async function ensureLogicalDevices(
     desired.push({
       kind: "RGB",
       pin: null,
-      icon: "assets/images/color wheel icon.png",
+      icon: "assets/images/color_wheel_icon.png",
     });
 
   const sortedPins = [...pins].sort((a, b) => a - b);

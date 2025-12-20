@@ -5,6 +5,7 @@ const { sql, poolPromise } = require("../SQL/sqlSetup");
 const {
   signAccess,
   signRefresh,
+  verifyAccess,
   ttlToMs,
   REFRESH_TTL,
 } = require("../utils/jwt");
@@ -481,6 +482,124 @@ router.post("/refresh", async (req, res) => {
     return res.json({ access });
   } catch (e) {
     return res.status(401).json({ message: "invalid" });
+  }
+});
+//
+/* ----------------------- POST /auth/change-password ----------------------- */
+/**
+ * Headers:
+ *   Authorization: Bearer <access_token>
+ * Body:
+ * {
+ *   "oldPassword": "OldPassw0rd!",
+ *   "newPassword": "NewPassw0rd!"
+ * }
+ */
+router.post("/change-password", async (req, res) => {
+  const auth = req.headers.authorization || "";
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (!m) {
+    return res.status(401).json({
+      status: false,
+      code: "NO_TOKEN",
+      message: "Missing Authorization Bearer token",
+    });
+  }
+
+  const { oldPassword, newPassword } = req.body || {};
+  if (!oldPassword || !newPassword) {
+    return res.status(400).json({
+      status: false,
+      code: "VALIDATION",
+      message: "oldPassword and newPassword are required",
+    });
+  }
+
+ 
+  if (String(newPassword).length < 6) {
+    return res.status(400).json({
+      status: false,
+      code: "WEAK_PASSWORD",
+      message: "newPassword must be at least 8 characters",
+    });
+  }
+
+  try {
+  
+    let payload;
+    try {
+      payload = verifyAccess(m[1]); 
+    } catch {
+      return res.status(401).json({
+        status: false,
+        code: "INVALID_TOKEN",
+        message: "Invalid or expired token",
+      });
+    }
+
+    const userId = payload.id;
+
+    const db = await poolPromise;
+
+  
+    const r = await db
+      .request()
+      .input("uid", sql.Int, userId)
+      .query("SELECT id, password_hash, is_active FROM Users WHERE id=@uid");
+
+    const user = r.recordset[0];
+    if (!user || user.is_active === 0) {
+      return res.status(401).json({
+        status: false,
+        code: "USER_NOT_FOUND",
+        message: "User not found or inactive",
+      });
+    }
+
+    const ok = await bcrypt.compare(
+      String(oldPassword),
+      user.password_hash || ""
+    );
+    if (!ok) {
+      return res.status(400).json({
+        status: false,
+        code: "OLD_PASSWORD_WRONG",
+        message: "Old password is incorrect",
+      });
+    }
+
+    // optional: prevent same password
+    const same = await bcrypt.compare(
+      String(newPassword),
+      user.password_hash || ""
+    );
+    if (same) {
+      return res.status(400).json({
+        status: false,
+        code: "SAME_PASSWORD",
+        message: "New password must be different",
+      });
+    }
+
+    // update hash
+    const newHash = await bcrypt.hash(String(newPassword), 10);
+    await db
+      .request()
+      .input("uid", sql.Int, userId)
+      .input("h", sql.VarChar, newHash)
+      .query("UPDATE Users SET password_hash=@h WHERE id=@uid");
+
+    return res.json({
+      status: true,
+      message: "Password changed",
+    });
+  } catch (err) {
+    console.error("change-password error:", err);
+    return res.status(500).json({
+      status: false,
+      code: "SERVER_ERROR",
+      message: "internal error",
+    });
   }
 });
 
