@@ -1,271 +1,242 @@
 const express = require("express");
-const { sql, poolPromise } = require("../SQL/sqlSetup");
+const { getDb, nextId } = require("../DB/mongo");
 const requireAuth = require("../middleware/requireAuth");
+const {
+  isManager,
+  listHomesForUser,
+  pick,
+  userRole,
+} = require("../services/mongoData");
 
 const router = express.Router();
 
-/** utils */
-async function userRole(db, homeId, userId) {
-  const r = await db
-    .request()
-    .input("h", sql.Int, homeId)
-    .input("u", sql.Int, userId)
-    .query("SELECT role FROM HomeMembers WHERE home_id=@h AND user_id=@u");
-  return r.recordset[0]?.role || null;
-}
-function isManager(role) {
-  return role === "owner" || role === "admin";
-}
-
-/** Create home (creator becomes owner) */
 router.post("/", requireAuth, async (req, res) => {
   const { name, timezone } = req.body || {};
   if (!name) return res.status(400).json({ message: "name required" });
 
   try {
-    const db = await poolPromise;
-    const ins = await db
-      .request()
-      .input("n", sql.NVarChar, name)
-      .input("tz", sql.VarChar, timezone || "Africa/Cairo")
-      .input("u", sql.Int, req.user.id).query(`
-        DECLARE @id INT;
-        INSERT INTO Homes(name, timezone, created_by, created_at)
-        VALUES(@n, @tz, @u, SYSDATETIMEOFFSET());
-        SET @id = SCOPE_IDENTITY();
-        INSERT INTO HomeMembers(home_id, user_id, role)
-        VALUES(@id, @u, 'owner');
-        SELECT @id AS id;
-      `);
-    res.status(201).json({ id: ins.recordset[0].id });
+    const db = await getDb();
+    const homeId = await nextId("homes");
+
+    await db.collection("homes").insertOne({
+      id: homeId,
+      name,
+      timezone: timezone || "Africa/Cairo",
+      created_by: req.user.id,
+      created_at: new Date(),
+    });
+    await db.collection("homeMembers").insertOne({
+      home_id: homeId,
+      user_id: req.user.id,
+      role: "owner",
+    });
+
+    return res.status(201).json({ id: homeId });
   } catch (e) {
     console.error("create home error:", e);
-    res.status(500).json({ message: "internal error" });
+    return res.status(500).json({ message: "internal error" });
   }
 });
 
-/** List homes I belong to */
 router.get("/mine", requireAuth, async (req, res) => {
   try {
-    const db = await poolPromise;
-    const r = await db.request().input("u", sql.Int, req.user.id).query(`
-        SELECT h.id, h.name, h.timezone, m.role
-        FROM HomeMembers m
-        JOIN Homes h ON h.id = m.home_id
-        WHERE m.user_id = @u
-        ORDER BY h.id DESC
-      `);
-    res.json(r.recordset);
+    return res.json(await listHomesForUser(req.user.id));
   } catch (e) {
     console.error("list homes error:", e);
-    res.status(500).json({ message: "internal error" });
+    return res.status(500).json({ message: "internal error" });
   }
 });
 
-/** Get one home (only members) */
 router.get("/:homeId", requireAuth, async (req, res) => {
   const homeId = Number(req.params.homeId);
   try {
-    const db = await poolPromise;
-    const role = await userRole(db, homeId, req.user.id);
+    const db = await getDb();
+    const role = await userRole(homeId, req.user.id);
     if (!role) return res.status(403).json({ message: "not in home" });
 
-    const r = await db
-      .request()
-      .input("h", sql.Int, homeId)
-      .query(
-        "SELECT id, name, timezone, created_by, created_at FROM Homes WHERE id=@h"
-      );
-    if (!r.recordset[0]) return res.status(404).json({ message: "not found" });
-    res.json(r.recordset[0]);
+    const home = await db
+      .collection("homes")
+      .findOne({ id: homeId }, { projection: { _id: 0 } });
+    if (!home) return res.status(404).json({ message: "not found" });
+
+    return res.json(
+      pick(home, ["id", "name", "timezone", "created_by", "created_at"])
+    );
   } catch (e) {
     console.error("get home error:", e);
-    res.status(500).json({ message: "internal error" });
+    return res.status(500).json({ message: "internal error" });
   }
 });
 
-/** Update home (name/timezone) – admins/owner only */
 router.put("/", requireAuth, async (req, res) => {
-  //   const homeId = Number(req.params.homeId);
   const { name, timezone, homeId } = req.body || {};
   try {
-    const db = await poolPromise;
-    const role = await userRole(db, homeId, req.user.id);
-    if (!isManager(role))
+    const db = await getDb();
+    const role = await userRole(homeId, req.user.id);
+    if (!isManager(role)) {
       return res.status(403).json({ message: "admin/owner only" });
+    }
 
-    await db
-      .request()
-      .input("h", sql.Int, homeId)
-      .input("n", sql.NVarChar, name || null)
-      .input("tz", sql.VarChar, timezone || null).query(`
-        UPDATE Homes
-        SET name = COALESCE(@n, name),
-            timezone = COALESCE(@tz, timezone)
-        WHERE id=@h
-      `);
-    res.json({ status: true });
+    const $set = {};
+    if (name) $set.name = name;
+    if (timezone) $set.timezone = timezone;
+
+    if (Object.keys($set).length) {
+      await db.collection("homes").updateOne({ id: Number(homeId) }, { $set });
+    }
+
+    return res.json({ status: true });
   } catch (e) {
     console.error("update home error:", e);
-    res.status(500).json({ message: "internal error" });
+    return res.status(500).json({ message: "internal error" });
   }
 });
 
-/** Delete home – owner only, must be empty of devices/rooms */
 router.delete("/:homeId", requireAuth, async (req, res) => {
   const homeId = Number(req.params.homeId);
   try {
-    const db = await poolPromise;
-    const role = await userRole(db, homeId, req.user.id);
-    if (role !== "owner")
+    const db = await getDb();
+    const role = await userRole(homeId, req.user.id);
+    if (role !== "owner") {
       return res.status(403).json({ message: "owner only" });
+    }
 
-    // ensure empty (no devices/rooms)
-    const chk = await db.request().input("h", sql.Int, homeId).query(`
-      SELECT
-        (SELECT COUNT(*) FROM Devices WHERE home_id=@h) AS devices,
-        (SELECT COUNT(*) FROM Rooms   WHERE home_id=@h) AS rooms
-    `);
-    const { devices, rooms } = chk.recordset[0];
+    const devices = await db.collection("devices").countDocuments({
+      home_id: homeId,
+    });
+    const rooms = await db.collection("rooms").countDocuments({
+      home_id: homeId,
+    });
     if (devices > 0 || rooms > 0) {
       return res.status(409).json({ message: "home not empty" });
     }
 
-    await db.request().input("h", sql.Int, homeId).query(`
-      DELETE FROM HomeMembers WHERE home_id=@h;
-      DELETE FROM Homes WHERE id=@h;
-    `);
-    res.json({ status: true });
+    await db.collection("homeMembers").deleteMany({ home_id: homeId });
+    await db.collection("homes").deleteOne({ id: homeId });
+
+    return res.json({ status: true });
   } catch (e) {
     console.error("delete home error:", e);
-    res.status(500).json({ message: "internal error" });
+    return res.status(500).json({ message: "internal error" });
   }
 });
 
-/** Invite/add member – admins/owner */
 router.post("/:homeId/members", requireAuth, async (req, res) => {
   const homeId = Number(req.params.homeId);
-  const { user_id, role } = req.body || {}; // role: admin|member
-  if (!user_id || !role)
+  const { user_id, role } = req.body || {};
+  if (!user_id || !role) {
     return res.status(400).json({ message: "user_id and role required" });
+  }
 
   try {
-    const db = await poolPromise;
-    const myRole = await userRole(db, homeId, req.user.id);
-    if (!isManager(myRole))
+    const db = await getDb();
+    const myRole = await userRole(homeId, req.user.id);
+    if (!isManager(myRole)) {
       return res.status(403).json({ message: "admin/owner only" });
+    }
 
-    await db
-      .request()
-      .input("h", sql.Int, homeId)
-      .input("u", sql.Int, user_id)
-      .input("r", sql.VarChar, role).query(`
-        IF NOT EXISTS (SELECT 1 FROM HomeMembers WHERE home_id=@h AND user_id=@u)
-          INSERT INTO HomeMembers(home_id, user_id, role) VALUES(@h, @u, @r)
-        ELSE
-          UPDATE HomeMembers SET role=@r WHERE home_id=@h AND user_id=@u
-      `);
-    res.json({ status: true });
+    await db.collection("homeMembers").updateOne(
+      { home_id: homeId, user_id: Number(user_id) },
+      { $set: { role } },
+      { upsert: true }
+    );
+    return res.json({ status: true });
   } catch (e) {
     console.error("add member error:", e);
-    res.status(500).json({ message: "internal error" });
+    return res.status(500).json({ message: "internal error" });
   }
 });
 
-/** Remove member – admins/owner (cannot remove owner) */
 router.delete("/:homeId/members/:userId", requireAuth, async (req, res) => {
   const homeId = Number(req.params.homeId);
   const targetUserId = Number(req.params.userId);
   try {
-    const db = await poolPromise;
-    const myRole = await userRole(db, homeId, req.user.id);
-    if (!isManager(myRole))
+    const db = await getDb();
+    const myRole = await userRole(homeId, req.user.id);
+    if (!isManager(myRole)) {
       return res.status(403).json({ message: "admin/owner only" });
+    }
 
-    const role = await userRole(db, homeId, targetUserId);
-    if (role === "owner")
+    const role = await userRole(homeId, targetUserId);
+    if (role === "owner") {
       return res.status(409).json({ message: "cannot remove owner" });
+    }
 
     await db
-      .request()
-      .input("h", sql.Int, homeId)
-      .input("u", sql.Int, targetUserId)
-      .query("DELETE FROM HomeMembers WHERE home_id=@h AND user_id=@u");
-    res.json({ status: true });
+      .collection("homeMembers")
+      .deleteOne({ home_id: homeId, user_id: targetUserId });
+    return res.json({ status: true });
   } catch (e) {
     console.error("remove member error:", e);
-    res.status(500).json({ message: "internal error" });
+    return res.status(500).json({ message: "internal error" });
   }
 });
-// --- List members of a home  ---
-// --- List members with attached room ids + names (admin/owner only)
+
 router.get("/:homeId/members", requireAuth, async (req, res) => {
   const homeId = Number(req.params.homeId);
   try {
-    const db = await poolPromise;
-
-    const my = await db
-      .request()
-      .input("h", sql.Int, homeId)
-      .input("u", sql.Int, req.user.id)
-      .query("SELECT role FROM HomeMembers WHERE home_id=@h AND user_id=@u");
-    const myRole = my.recordset[0]?.role;
-    if (!(myRole === "owner" || myRole === "admin"))
+    const db = await getDb();
+    const myRole = await userRole(homeId, req.user.id);
+    if (!isManager(myRole)) {
       return res.status(403).json({ message: "admin/owner only" });
+    }
 
-    const q = `
-      WITH Members AS (
-        SELECT m.user_id, m.role, u.email
-        FROM HomeMembers m
-        JOIN Users u ON u.id = m.user_id
-        WHERE m.home_id = @h
+    const memberships = await db
+      .collection("homeMembers")
+      .find({ home_id: homeId }, { projection: { _id: 0 } })
+      .toArray();
+    const userIds = memberships.map((m) => m.user_id);
+    const users = await db
+      .collection("users")
+      .find(
+        { id: { $in: userIds } },
+        { projection: { _id: 0, id: 1, email: 1 } }
       )
-      SELECT
-        M.user_id,
-        M.email,
-        M.role,
-        -- ids
-        (SELECT a.room_id
-         FROM HomeRoomAccess a
-         WHERE a.home_id=@h AND a.user_id=M.user_id
-         ORDER BY a.room_id
-         FOR JSON PATH) AS rooms_json,
-        -- names
-        (SELECT a.room_id AS id, r.name
-         FROM HomeRoomAccess a
-         JOIN Rooms r ON r.id = a.room_id
-         WHERE a.home_id=@h AND a.user_id=M.user_id
-         ORDER BY r.sort_order, r.id
-         FOR JSON PATH) AS rooms_named_json
-      FROM Members M
-      ORDER BY CASE M.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, M.user_id;
-    `;
-    const r = await db.request().input("h", sql.Int, homeId).query(q);
+      .toArray();
+    const emailById = new Map(users.map((u) => [u.id, u.email]));
+    const roleRank = { owner: 0, admin: 1 };
 
-    const out = r.recordset.map((row) => {
-      let ids = null,
-        named = null;
-      try {
-        const arr = JSON.parse(row.rooms_json || "[]");
-        if (arr.length) ids = arr.map((x) => x.room_id);
-      } catch {}
-      try {
-        const arr = JSON.parse(row.rooms_named_json || "[]");
-        if (arr.length) named = arr;
-      } catch {}
-      return {
-        user_id: row.user_id,
-        email: row.email,
-        role: row.role,
-        allowed_room_ids: ids, // null => full-home access
-        allowed_rooms: named, // [{id, name}] or null
-      };
-    });
+    const out = [];
+    for (const member of memberships.sort((a, b) => {
+      const roleDiff =
+        (roleRank[a.role] ?? 2) - (roleRank[b.role] ?? 2);
+      return roleDiff || a.user_id - b.user_id;
+    })) {
+      const access = await db
+        .collection("homeRoomAccess")
+        .find(
+          { home_id: homeId, user_id: member.user_id },
+          { projection: { _id: 0, room_id: 1 } }
+        )
+        .sort({ room_id: 1 })
+        .toArray();
+      const roomIds = access.map((row) => row.room_id);
+      const rooms = roomIds.length
+        ? await db
+            .collection("rooms")
+            .find(
+              { home_id: homeId, id: { $in: roomIds } },
+              { projection: { _id: 0, id: 1, name: 1, sort_order: 1 } }
+            )
+            .sort({ sort_order: 1, id: 1 })
+            .toArray()
+        : [];
 
-    res.json(out);
+      out.push({
+        user_id: member.user_id,
+        email: emailById.get(member.user_id),
+        role: member.role,
+        allowed_room_ids: roomIds.length ? roomIds : null,
+        allowed_rooms: rooms.length
+          ? rooms.map((room) => pick(room, ["id", "name"]))
+          : null,
+      });
+    }
+
+    return res.json(out);
   } catch (e) {
     console.error("list members error:", e);
-    res.status(500).json({ message: "internal error" });
+    return res.status(500).json({ message: "internal error" });
   }
 });
 

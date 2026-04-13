@@ -1,133 +1,23 @@
-// API/auth.js
 const express = require("express");
 const bcrypt = require("bcryptjs");
-const { sql, poolPromise } = require("../SQL/sqlSetup");
+const { getDb, nextId } = require("../DB/mongo");
+const {
+  duplicateKey,
+  getOverview,
+} = require("../services/mongoData");
 const {
   signAccess,
   signRefresh,
   verifyAccess,
+  verifyRefresh,
   ttlToMs,
   REFRESH_TTL,
 } = require("../utils/jwt");
 
 const router = express.Router();
-
-/* --------------------------------- helpers --------------------------------- */
-// API/auth.js
-
-async function getOverview(db, userId) {
-  const homes = await db.request().input("u", sql.Int, userId).query(`
-    SELECT h.id, h.name, h.timezone, m.role
-    FROM HomeMembers m
-    JOIN Homes h ON h.id = m.home_id
-    WHERE m.user_id=@u
-    ORDER BY h.id DESC
-  `);
-
-  const out = [];
-  for (const h of homes.recordset) {
-    const hid = h.id;
-    const role = h.role;
-
-    let roomsQ;
-    let devicesQ;
-
-    if (role === "owner" || role === "admin") {
-      roomsQ = `
-        SELECT id, home_id, name, sort_order, is_private, icon_path
-        FROM Rooms
-        WHERE home_id=@h
-        ORDER BY sort_order, id
-      `;
-
-      devicesQ = `
-        SELECT d.id, d.device_id, d.name, d.type, d.room_id, d.pin,
-               d.meta, d.is_active, d.icon_path
-        FROM Devices d
-        WHERE d.home_id=@h
-        ORDER BY d.id DESC
-      `;
-    } else {
-      roomsQ = `
-        SELECT r.id, r.home_id, r.name, r.sort_order, r.is_private, r.icon_path
-        FROM Rooms r
-        WHERE r.home_id=@h
-          AND (
-            r.created_by=@u
-            OR EXISTS (
-              SELECT 1
-              FROM HomeRoomAccess a
-              WHERE a.home_id=@h
-                AND a.user_id=@u
-                AND a.room_id=r.id
-            )
-          )
-        ORDER BY r.sort_order, r.id
-      `;
-
-      devicesQ = `
-        SELECT d.id, d.device_id, d.name, d.type, d.room_id, d.pin,
-               d.meta, d.is_active, d.icon_path
-        FROM Devices d
-        LEFT JOIN Rooms r ON r.id = d.room_id
-        WHERE d.home_id=@h
-          AND (
-            r.created_by=@u
-            OR EXISTS (
-              SELECT 1
-              FROM HomeRoomAccess a
-              WHERE a.home_id=@h
-                AND a.user_id=@u
-                AND a.room_id=r.id
-            )
-          )
-        ORDER BY d.id DESC
-      `;
-    }
-
-    const rooms = await db
-      .request()
-      .input("h", sql.Int, hid)
-      .input("u", sql.Int, userId)
-      .query(roomsQ);
-
-    const devices = await db
-      .request()
-      .input("h", sql.Int, hid)
-      .input("u", sql.Int, userId)
-      .query(devicesQ);
-
-    out.push({
-      home: { id: hid, name: h.name, timezone: h.timezone, role },
-      rooms: rooms.recordset,
-      devices: devices.recordset,
-    });
-  }
-
-  return out;
-}
-
-/* ------------------- POST /auth/register-with-home ------------------- */
-/**
- * Body:
- * {
- *   "name": "Ibrahim",
- *   "mobile": "010xxxxxxx",   // unique (nullable is allowed)
- *   "email": "owner@example.com",
- *   "password": "Passw0rd!",
- *   "home": {
- *     "name": "Ambosh Home",
- *     "timezone": "Africa/Cairo",
- *     "address": "Cairo",
- *     "rooms": ["Living Room","Kitchen"]   // optional seed, public rooms
- *   },
- *   "autoLogin": true
- * }
- */
 const DEFAULT_ROOM_ICON = "assets/images/public.png";
 
 router.post("/register-with-home", async (req, res) => {
-  // ---- 1) Normalize & validate inputs ----
   const raw = req.body || {};
   const home = raw.home || {};
 
@@ -137,9 +27,11 @@ router.post("/register-with-home", async (req, res) => {
   const password = raw.password;
 
   const homeName = (home.name ?? "").trim();
-  const timezone = (home.timezone ?? "").trim();
+  const timezone = (home.timezone ?? "").trim() || "Africa/Cairo";
   const address = home.address ?? null;
   const rooms = Array.isArray(home.rooms) ? home.rooms : [];
+  const seedRooms = [];
+  const seenSeedRooms = new Set();
 
   if (!name || !mobile || !email || !password || !homeName) {
     return res.status(400).json({
@@ -149,7 +41,6 @@ router.post("/register-with-home", async (req, res) => {
     });
   }
 
-  // Egypt 11-digit local mobile format (adjust if needed)
   const egMobile = /^(01[0-2,5]\d{8})$/;
   if (!egMobile.test(mobile)) {
     return res.status(400).json({
@@ -160,33 +51,39 @@ router.post("/register-with-home", async (req, res) => {
     });
   }
 
-  // ---- 2) Start Tx ----
-  const pool = await poolPromise;
-  const tx = new sql.Transaction(pool);
+  for (const roomInput of rooms) {
+    const roomName =
+      typeof roomInput === "object" && roomInput !== null
+        ? String(roomInput.name || "").trim()
+        : String(roomInput || "").trim();
+    if (!roomName) continue;
+
+    const roomKey = roomName.toLowerCase();
+    if (seenSeedRooms.has(roomKey)) continue;
+    seenSeedRooms.add(roomKey);
+
+    seedRooms.push({
+      name: roomName,
+      icon_path:
+        typeof roomInput === "object" && roomInput !== null && roomInput.icon_path
+          ? String(roomInput.icon_path).trim()
+          : DEFAULT_ROOM_ICON,
+    });
+  }
 
   try {
-    await tx.begin();
+    const db = await getDb();
+    const users = db.collection("users");
 
-    // ---- 3) Uniqueness checks (email + mobile) ----
-    const chk = await new sql.Request(tx)
-      .input("e", sql.VarChar, email)
-      .input("m", sql.VarChar, mobile).query(`
-        SELECT
-          (SELECT COUNT(*) FROM Users WHERE email=@e)  AS email_exists,
-          (SELECT COUNT(*) FROM Users WHERE mobile=@m) AS mobile_exists
-      `);
-
-    const { email_exists = 0, mobile_exists = 0 } = chk.recordset[0] || {};
-    if (email_exists) {
-      await tx.rollback();
+    if (await users.findOne({ email })) {
       return res.status(409).json({
         status: false,
         code: "EMAIL_TAKEN",
         message: "Email already registered",
       });
     }
-    if (mobile_exists) {
-      await tx.rollback();
+
+    if (await users.findOne({ mobile })) {
       return res.status(409).json({
         status: false,
         code: "MOBILE_TAKEN",
@@ -194,71 +91,48 @@ router.post("/register-with-home", async (req, res) => {
       });
     }
 
-    // ---- 4) Create user ----
     const hash = await bcrypt.hash(password, 10);
-    const userIns = await new sql.Request(tx)
-      .input("n", sql.NVarChar, name)
-      .input("m", sql.VarChar, mobile)
-      .input("e", sql.VarChar, email)
-      .input("p", sql.VarChar, hash).query(`
-        INSERT INTO Users (name, mobile, email, password_hash, is_active, created_at)
-        OUTPUT inserted.id, inserted.name, inserted.mobile, inserted.email
-        VALUES (@n, @m, @e, @p, 1, SYSDATETIMEOFFSET())
-      `);
-    const user = userIns.recordset[0];
+    const user = {
+      id: await nextId("users"),
+      name,
+      mobile,
+      email,
+      password_hash: hash,
+      is_active: true,
+      created_at: new Date(),
+    };
+    await users.insertOne(user);
 
-    // ---- 5) Create home ----
-    const homeIns = await new sql.Request(tx)
-      .input("n", sql.NVarChar, homeName)
-      .input("tz", sql.VarChar, timezone || "Africa/Cairo")
-      .input("a", sql.NVarChar, address)
-      .input("u", sql.Int, user.id).query(`
-        INSERT INTO Homes (name, timezone, address, created_by, created_at)
-        OUTPUT inserted.id
-        VALUES (@n, @tz, @a, @u, SYSDATETIMEOFFSET())
-      `);
-    const homeId = homeIns.recordset[0].id;
+    const homeDoc = {
+      id: await nextId("homes"),
+      name: homeName,
+      timezone,
+      address,
+      created_by: user.id,
+      created_at: new Date(),
+    };
+    await db.collection("homes").insertOne(homeDoc);
 
-    // ---- 6) Owner membership ----
-    await new sql.Request(tx)
-      .input("h", sql.Int, homeId)
-      .input("u", sql.Int, user.id)
-      .input("r", sql.VarChar, "owner")
-      .query(
-        `INSERT INTO HomeMembers(home_id, user_id, role) VALUES(@h, @u, @r)`
-      );
+    await db.collection("homeMembers").insertOne({
+      home_id: homeDoc.id,
+      user_id: user.id,
+      role: "owner",
+    });
 
-    // ---- 7) Optional seed rooms (public), with icon defaults ----
-    if (rooms.length) {
-      let order = 1;
-      for (const r of rooms) {
-        // allow both ["Kitchen", ...] and [{ name, icon_path }, ...]
-        const roomName =
-          typeof r === "object" && r !== null
-            ? String(r.name || "").trim()
-            : String(r || "").trim();
-
-        if (!roomName) continue;
-
-        const iconPath =
-          typeof r === "object" && r !== null && r.icon_path
-            ? String(r.icon_path).trim()
-            : DEFAULT_ROOM_ICON;
-
-        await new sql.Request(tx)
-          .input("h", sql.Int, homeId)
-          .input("n", sql.NVarChar, roomName)
-          .input("o", sql.Int, order++)
-          .input("i", sql.NVarChar, iconPath).query(`
-            INSERT INTO Rooms (home_id, name, sort_order, icon_path, created_at)
-            VALUES(@h, @n, @o, @i, SYSDATETIMEOFFSET())
-          `);
-      }
+    let order = 1;
+    for (const roomInput of seedRooms) {
+      await db.collection("rooms").insertOne({
+        id: await nextId("rooms"),
+        home_id: homeDoc.id,
+        name: roomInput.name,
+        sort_order: order++,
+        is_private: false,
+        icon_path: roomInput.icon_path,
+        created_by: user.id,
+        created_at: new Date(),
+      });
     }
 
-    await tx.commit();
-
-    // ---- 8) Auto-login? issue tokens + store refresh + overview ----
     const autoLogin = raw.autoLogin !== false;
     if (!autoLogin) {
       return res.status(201).json({
@@ -270,103 +144,20 @@ router.post("/register-with-home", async (req, res) => {
           mobile: user.mobile,
           email: user.email,
         },
-        home_id: homeId,
+        home_id: homeDoc.id,
       });
     }
 
     const access = signAccess({ id: user.id });
     const refresh = signRefresh({ id: user.id });
 
-    await pool
-      .request()
-      .input("uid", sql.Int, user.id)
-      .input("tok", sql.VarChar, refresh)
-      .input("exp", sql.DateTime2, new Date(Date.now() + ttlToMs(REFRESH_TTL)))
-      .query(
-        "INSERT INTO RefreshTokens(user_id, token, expires_at) VALUES(@uid, @tok, @exp)"
-      );
-
-    // getOverview must SELECT icon_path for Rooms/Devices so it flows here
-    const overview = await (async function getOverview(db, userId) {
-      const homes = await db.request().input("u", sql.Int, userId).query(`
-        SELECT h.id, h.name, h.timezone, m.role
-        FROM HomeMembers m
-        JOIN Homes h ON h.id = m.home_id
-        WHERE m.user_id=@u
-        ORDER BY h.id DESC
-      `);
-
-      const out = [];
-      for (const h of homes.recordset) {
-        const hid = h.id;
-
-        const roomsQ =
-          h.role === "owner" || h.role === "admin"
-            ? `
-            SELECT id, home_id, name, sort_order, is_private, icon_path
-            FROM Rooms
-            WHERE home_id=@h
-            ORDER BY sort_order, id
-          `
-            : `
-            SELECT r.id, r.home_id, r.name, r.sort_order, r.is_private, r.icon_path
-            FROM Rooms r
-            WHERE r.home_id=@h
-              AND (
-                r.is_private=0
-                OR r.created_by=@u
-                OR EXISTS (
-                  SELECT 1 FROM HomeRoomAccess a
-                  WHERE a.home_id=@h AND a.user_id=@u AND a.room_id=r.id
-                )
-              )
-            ORDER BY r.sort_order, r.id
-          `;
-        const rooms = await db
-          .request()
-          .input("h", sql.Int, hid)
-          .input("u", sql.Int, userId)
-          .query(roomsQ);
-
-        const devicesQ =
-          h.role === "owner" || h.role === "admin"
-            ? `
-            SELECT d.id, d.device_id, d.name, d.type, d.room_id, d.pin, d.meta, d.is_active, d.icon_path
-            FROM Devices d
-            WHERE d.home_id=@h
-            ORDER BY d.id DESC
-          `
-            : `
-            SELECT d.id, d.device_id, d.name, d.type, d.room_id, d.pin, d.meta, d.is_active, d.icon_path
-            FROM Devices d
-            LEFT JOIN Rooms r ON r.id = d.room_id
-            WHERE d.home_id=@h
-              AND (
-                r.id IS NULL
-                OR r.is_private=0
-                OR r.created_by=@u
-                OR EXISTS (
-                  SELECT 1 FROM HomeRoomAccess a
-                  WHERE a.home_id=@h AND a.user_id=@u AND a.room_id=r.id
-                )
-              )
-            ORDER BY d.id DESC
-          `;
-
-        const devices = await db
-          .request()
-          .input("h", sql.Int, hid)
-          .input("u", sql.Int, userId)
-          .query(devicesQ);
-
-        out.push({
-          home: { id: hid, name: h.name, timezone: h.timezone, role: h.role },
-          rooms: rooms.recordset,
-          devices: devices.recordset,
-        });
-      }
-      return out;
-    })(pool, user.id);
+    await db.collection("refreshTokens").insertOne({
+      id: await nextId("refreshTokens"),
+      user_id: user.id,
+      token: refresh,
+      expires_at: new Date(Date.now() + ttlToMs(REFRESH_TTL)),
+      created_at: new Date(),
+    });
 
     return res.status(201).json({
       status: true,
@@ -379,13 +170,10 @@ router.post("/register-with-home", async (req, res) => {
       },
       access,
       refresh,
-      overview,
+      overview: await getOverview(user.id),
     });
   } catch (err) {
-    try {
-      await tx.rollback();
-    } catch {}
-    if (err && (err.number === 2627 || err.number === 2601)) {
+    if (duplicateKey(err)) {
       return res.status(409).json({
         status: false,
         code: "DUPLICATE",
@@ -396,25 +184,32 @@ router.post("/register-with-home", async (req, res) => {
     return res.status(500).json({ status: false, message: "internal error" });
   }
 });
-/* -------------------------- POST /auth/login -------------------------- */
-/** Returns: user, access, refresh, overview */
+
 router.post("/login", async (req, res) => {
-  const { email, password } = req.body || {};
+  const email = (req.body?.email || "").trim().toLowerCase();
+  const { password } = req.body || {};
   if (!email || !password) {
     return res.status(400).json({ message: "email and password are required" });
   }
 
   try {
-    const db = await poolPromise;
-    const r = await db
-      .request()
-      .input("e", sql.VarChar, email)
-      .query(
-        "SELECT id, password_hash, is_active, name, mobile, email FROM Users WHERE email=@e"
-      );
+    const db = await getDb();
+    const user = await db.collection("users").findOne(
+      { email },
+      {
+        projection: {
+          _id: 0,
+          id: 1,
+          password_hash: 1,
+          is_active: 1,
+          name: 1,
+          mobile: 1,
+          email: 1,
+        },
+      }
+    );
 
-    const user = r.recordset[0];
-    if (!user || user.is_active === 0) {
+    if (!user || user.is_active === false) {
       return res.status(401).json({ message: "invalid credentials" });
     }
 
@@ -426,16 +221,13 @@ router.post("/login", async (req, res) => {
     const access = signAccess({ id: user.id });
     const refresh = signRefresh({ id: user.id });
 
-    await db
-      .request()
-      .input("uid", sql.Int, user.id)
-      .input("tok", sql.VarChar, refresh)
-      .input("exp", sql.DateTime2, new Date(Date.now() + 30 * 24 * 3600 * 1000))
-      .query(
-        "INSERT INTO RefreshTokens(user_id,token,expires_at) VALUES(@uid,@tok,@exp)"
-      );
-
-    const overview = await getOverview(db, user.id);
+    await db.collection("refreshTokens").insertOne({
+      id: await nextId("refreshTokens"),
+      user_id: user.id,
+      token: refresh,
+      expires_at: new Date(Date.now() + ttlToMs(REFRESH_TTL)),
+      created_at: new Date(),
+    });
 
     return res.json({
       user: {
@@ -446,7 +238,7 @@ router.post("/login", async (req, res) => {
       },
       access,
       refresh,
-      overview,
+      overview: await getOverview(user.id),
     });
   } catch (err) {
     console.error("login error:", err);
@@ -454,47 +246,27 @@ router.post("/login", async (req, res) => {
   }
 });
 
-/* ------------------------- POST /auth/refresh ------------------------- */
-/** Verifies refresh, binds it to the same user, returns new access token */
 router.post("/refresh", async (req, res) => {
   try {
     const { refresh } = req.body || {};
-    const payload = verifyRefresh(refresh); // { id, iat, exp }
-    const db = await poolPromise;
+    const payload = verifyRefresh(refresh);
+    const db = await getDb();
 
-    const r = await db
-      .request()
-      .input("tok", sql.VarChar, refresh)
-      .input("uid", sql.Int, payload.id)
-      .query(
-        `
-        SELECT id
-        FROM RefreshTokens
-        WHERE token=@tok
-          AND user_id=@uid
-          AND expires_at > SYSUTCDATETIME()
-      `
-      );
+    const token = await db.collection("refreshTokens").findOne({
+      token: refresh,
+      user_id: payload.id,
+      expires_at: { $gt: new Date() },
+    });
 
-    if (!r.recordset[0]) return res.status(401).json({ message: "invalid" });
+    if (!token) return res.status(401).json({ message: "invalid" });
 
     const access = signAccess({ id: payload.id });
     return res.json({ access });
-  } catch (e) {
+  } catch {
     return res.status(401).json({ message: "invalid" });
   }
 });
-//
-/* ----------------------- POST /auth/change-password ----------------------- */
-/**
- * Headers:
- *   Authorization: Bearer <access_token>
- * Body:
- * {
- *   "oldPassword": "OldPassw0rd!",
- *   "newPassword": "NewPassw0rd!"
- * }
- */
+
 router.post("/change-password", async (req, res) => {
   const auth = req.headers.authorization || "";
   const m = auth.match(/^Bearer\s+(.+)$/i);
@@ -515,7 +287,6 @@ router.post("/change-password", async (req, res) => {
     });
   }
 
- 
   if (String(newPassword).length < 6) {
     return res.status(400).json({
       status: false,
@@ -525,10 +296,9 @@ router.post("/change-password", async (req, res) => {
   }
 
   try {
-  
     let payload;
     try {
-      payload = verifyAccess(m[1]); 
+      payload = verifyAccess(m[1]);
     } catch {
       return res.status(401).json({
         status: false,
@@ -537,18 +307,13 @@ router.post("/change-password", async (req, res) => {
       });
     }
 
-    const userId = payload.id;
+    const db = await getDb();
+    const user = await db.collection("users").findOne(
+      { id: payload.id },
+      { projection: { _id: 0, id: 1, password_hash: 1, is_active: 1 } }
+    );
 
-    const db = await poolPromise;
-
-  
-    const r = await db
-      .request()
-      .input("uid", sql.Int, userId)
-      .query("SELECT id, password_hash, is_active FROM Users WHERE id=@uid");
-
-    const user = r.recordset[0];
-    if (!user || user.is_active === 0) {
+    if (!user || user.is_active === false) {
       return res.status(401).json({
         status: false,
         code: "USER_NOT_FOUND",
@@ -568,7 +333,6 @@ router.post("/change-password", async (req, res) => {
       });
     }
 
-    // optional: prevent same password
     const same = await bcrypt.compare(
       String(newPassword),
       user.password_hash || ""
@@ -581,13 +345,10 @@ router.post("/change-password", async (req, res) => {
       });
     }
 
-    // update hash
     const newHash = await bcrypt.hash(String(newPassword), 10);
     await db
-      .request()
-      .input("uid", sql.Int, userId)
-      .input("h", sql.VarChar, newHash)
-      .query("UPDATE Users SET password_hash=@h WHERE id=@uid");
+      .collection("users")
+      .updateOne({ id: payload.id }, { $set: { password_hash: newHash } });
 
     return res.json({
       status: true,

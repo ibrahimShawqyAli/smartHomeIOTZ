@@ -1,43 +1,44 @@
 const express = require("express");
-const { sql, poolPromise } = require("../SQL/sqlSetup");
+const { getDb, nextId } = require("../DB/mongo");
 const requireAuth = require("../middleware/requireAuth");
+const { userRole } = require("../services/mongoData");
 
 const router = express.Router();
 
-// POST /schedules  body: { home_id, device_id | scene_id, action, rrule | cron, timezone }
 router.post("/", requireAuth, async (req, res) => {
   const { home_id, device_id, scene_id, action, rrule, cron, timezone } =
     req.body;
-  if (!!device_id === !!scene_id)
+  if (!!device_id === !!scene_id) {
     return res.status(400).json({ message: "choose device OR scene" });
-  if (!rrule && !cron)
+  }
+  if (!rrule && !cron) {
     return res.status(400).json({ message: "rrule or cron required" });
+  }
 
-  const db = await poolPromise;
+  try {
+    const db = await getDb();
+    const role = await userRole(home_id, req.user.id);
+    if (!role) return res.status(403).json({ message: "not in home" });
 
-  // must be member of the home
-  const m = await db
-    .request()
-    .input("h", sql.Int, home_id)
-    .input("u", sql.Int, req.user.id)
-    .query("SELECT 1 FROM HomeMembers WHERE home_id=@h AND user_id=@u");
-  if (!m.recordset[0]) return res.status(403).json({ message: "not in home" });
+    await db.collection("schedules").insertOne({
+      id: await nextId("schedules"),
+      home_id: Number(home_id),
+      device_id: device_id ? Number(device_id) : null,
+      scene_id: scene_id ? Number(scene_id) : null,
+      action: action || null,
+      rrule: rrule || null,
+      cron: cron || null,
+      timezone: timezone || "Africa/Cairo",
+      created_by: req.user.id,
+      is_active: true,
+      created_at: new Date(),
+    });
 
-  await db
-    .request()
-    .input("h", sql.Int, home_id)
-    .input("d", sql.Int, device_id || null)
-    .input("s", sql.Int, scene_id || null)
-    .input("a", sql.NVarChar, action || null)
-    .input("r", sql.VarChar, rrule || null)
-    .input("c", sql.VarChar, cron || null)
-    .input("tz", sql.VarChar, timezone || "Africa/Cairo")
-    .input("u", sql.Int, req.user.id).query(`
-      INSERT INTO Schedules(home_id, device_id, scene_id, action, rrule, cron, timezone, created_by)
-      VALUES(@h,@d,@s,@a,@r,@c,@tz,@u)
-    `);
-
-  res.json({ ok: true });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("create schedule error:", err);
+    return res.status(500).json({ message: "internal error" });
+  }
 });
 
 module.exports = router;

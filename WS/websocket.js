@@ -1,6 +1,7 @@
 const WebSocket = require("ws");
 const url = require("url");
-const { sql, poolPromise } = require("../SQL/sqlSetup");
+const { getDb, nextId } = require("../DB/mongo");
+const { cleanDocs } = require("../services/mongoData");
 const { setCommandStatus } = require("../services/commandStore");
 
 const deviceClients = new Map();
@@ -35,14 +36,16 @@ async function ensureLogicalDevices(
   if (!group_uid || !base_id) throw new Error("bad_device_id_format");
 
   const desired = [];
-  if (flags.has("I"))
+  if (flags.has("I")) {
     desired.push({ kind: "IR", pin: null, icon: "assets/images/ir.png" });
-  if (flags.has("R"))
+  }
+  if (flags.has("R")) {
     desired.push({
       kind: "RGB",
       pin: null,
       icon: "assets/images/color_wheel_icon.png",
     });
+  }
 
   const sortedPins = [...pins].sort((a, b) => a - b);
   sortedPins.forEach((p, i) =>
@@ -53,6 +56,8 @@ async function ensureLogicalDevices(
       icon: "assets/images/switch.png",
     })
   );
+
+  const devices = db.collection("devices");
 
   for (const d of desired) {
     const typeVal =
@@ -73,68 +78,72 @@ async function ensureLogicalDevices(
         ? `${base_id}-RGB`
         : `${base_id}-SW-${d.swIndex || 1}`;
 
-    const nmInsert = nmComputed || nmFallback;
+    const existing = await devices.findOne({
+      group_uid,
+      kind: d.kind,
+      pin: d.pin,
+    });
 
-    const upd = await db
-      .request()
-      .input("g", sql.VarChar, group_uid)
-      .input("k", sql.VarChar, d.kind)
-      .input("p", sql.Int, d.pin)
-      .input("nm", sql.NVarChar, nmComputed || null)
-      .input("hid", sql.Int, home_id ?? null)
-      .input("rid", sql.Int, room_id ?? null)
-      .input("icon", sql.VarChar, d.icon)
-      .input("typ", sql.VarChar, typeVal).query(`
-        UPDATE dbo.Devices
-           SET name      = COALESCE(@nm, name),
-               home_id   = COALESCE(@hid, home_id),
-               room_id   = COALESCE(@rid, room_id),
-               icon_path = COALESCE(NULLIF(icon_path,''), @icon),
-               type      = COALESCE(NULLIF(type,''), @typ)
-         WHERE group_uid = @g
-           AND kind      = @k
-           AND ((@k <> 'SW' AND pin IS NULL) OR (@k = 'SW' AND pin = @p));
-        SELECT @@ROWCOUNT AS n;
-      `);
+    if (existing) {
+      const $set = {};
+      if (nmComputed) $set.name = nmComputed;
+      if (home_id != null) $set.home_id = home_id;
+      if (room_id != null) $set.room_id = room_id;
+      if (!existing.icon_path) $set.icon_path = d.icon;
+      if (!existing.type) $set.type = typeVal;
+      $set.updated_at = new Date();
 
-    if ((upd.recordset[0]?.n || 0) === 0) {
-      await db
-        .request()
-        .input("device_id", sql.VarChar, fullId)
-        .input("sec", sql.VarChar, device_secret)
-        .input("hid", sql.Int, home_id ?? null)
-        .input("rid", sql.Int, room_id ?? null)
-        .input("nm", sql.NVarChar, nmInsert)
-        .input("base", sql.VarChar, base_id)
-        .input("grp", sql.VarChar, group_uid)
-        .input("k", sql.VarChar, d.kind)
-        .input("p", sql.Int, d.pin)
-        .input("icon", sql.VarChar, d.icon)
-        .input("typ", sql.VarChar, typeVal)
-        .input(
-          "meta",
-          sql.NVarChar,
-          JSON.stringify({
-            status: "unclaimed",
-            first_seen: new Date().toISOString(),
-          })
-        ).query(`
-          INSERT INTO dbo.Devices
-            (device_id, device_secret, home_id, room_id, name, base_id, group_uid, kind, pin, icon_path, type, meta, is_active)
-          VALUES
-            (@device_id, @sec, @hid, @rid, @nm, @base, @grp, @k, @p, @icon, @typ, @meta, 1);
-        `);
+      await devices.updateOne({ id: existing.id }, { $set });
+      continue;
     }
+
+    await devices.insertOne({
+      id: await nextId("devices"),
+      device_id: fullId,
+      device_secret,
+      home_id: home_id ?? null,
+      room_id: room_id ?? null,
+      name: nmComputed || nmFallback,
+      base_id,
+      group_uid,
+      kind: d.kind,
+      pin: d.pin,
+      icon_path: d.icon,
+      type: typeVal,
+      meta: JSON.stringify({
+        status: "unclaimed",
+        first_seen: new Date().toISOString(),
+      }),
+      is_active: true,
+      created_at: new Date(),
+      updated_at: new Date(),
+    });
   }
 
-  const rows = await db.request().input("g", sql.VarChar, group_uid).query(`
-      SELECT id, device_id, group_uid, base_id, kind, pin, home_id, room_id, name, icon_path, type
-      FROM dbo.Devices
-      WHERE group_uid=@g
-      ORDER BY kind, pin;
-    `);
+  const rows = await devices
+    .find(
+      { group_uid },
+      {
+        projection: {
+          _id: 0,
+          id: 1,
+          device_id: 1,
+          group_uid: 1,
+          base_id: 1,
+          kind: 1,
+          pin: 1,
+          home_id: 1,
+          room_id: 1,
+          name: 1,
+          icon_path: 1,
+          type: 1,
+        },
+      }
+    )
+    .sort({ kind: 1, pin: 1 })
+    .toArray();
 
-  return { base_id, group_uid, devices: rows.recordset };
+  return { base_id, group_uid, devices: cleanDocs(rows) };
 }
 
 function setupDeviceWs(server) {
@@ -142,7 +151,7 @@ function setupDeviceWs(server) {
     let pathname;
     try {
       pathname = new URL(req.url, `http://${req.headers.host}`).pathname;
-    } catch (e) {
+    } catch {
       try {
         socket.destroy();
       } catch {}
@@ -154,7 +163,7 @@ function setupDeviceWs(server) {
     });
   });
 
-  console.log("✅ /ws/device upgrade hook installed");
+  console.log("/ws/device upgrade hook installed");
 }
 
 wss.on("connection", async (ws, req) => {
@@ -187,8 +196,7 @@ wss.on("connection", async (ws, req) => {
       return;
     }
 
-    const db = await poolPromise;
-
+    const db = await getDb();
     const group = await ensureLogicalDevices(db, {
       fullId: device_id,
       device_secret,
@@ -203,20 +211,20 @@ wss.on("connection", async (ws, req) => {
     const primaryPk = ids[0];
     ws.primaryPk = primaryPk;
     console.log(
-      `✅ Device connected: ${device_id} → bound to logical ids=${ids.join(
-        ","
-      )}`
+      `Device connected: ${device_id} bound to logical ids=${ids.join(",")}`
     );
 
     try {
-      const pend = await db
-        .request()
-        .input("d", sql.Int, primaryPk)
-        .query(
-          "SELECT id, payload FROM dbo.PendingCommands WHERE device_id=@d ORDER BY id"
-        );
+      const pending = await db
+        .collection("pendingCommands")
+        .find(
+          { device_id: primaryPk },
+          { projection: { _id: 0, id: 1, payload: 1 } }
+        )
+        .sort({ id: 1 })
+        .toArray();
 
-      for (const row of pend.recordset) {
+      for (const row of pending) {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(
             JSON.stringify({
@@ -227,12 +235,14 @@ wss.on("connection", async (ws, req) => {
           );
         }
       }
-      await db
-        .request()
-        .input("d", sql.Int, primaryPk)
-        .query("DELETE FROM dbo.PendingCommands WHERE device_id=@d");
+
+      if (pending.length) {
+        await db.collection("pendingCommands").deleteMany({
+          id: { $in: pending.map((row) => row.id) },
+        });
+      }
     } catch (e) {
-      console.warn("flush pending (single) error:", e?.message || e);
+      console.warn("flush pending error:", e?.message || e);
     }
 
     ws.on("message", async (raw) => {
@@ -254,9 +264,6 @@ wss.on("connection", async (ws, req) => {
           } catch {}
         }
       }
-
-      if (msg.type === "shadow") {
-      }
     });
   } catch (e) {
     console.error("WS connection error:", e);
@@ -266,7 +273,7 @@ wss.on("connection", async (ws, req) => {
   }
 });
 
-console.log("✅ /ws/device ready (nickname/home/room supported)");
+console.log("/ws/device ready (nickname/home/room supported)");
 
 module.exports = {
   attachDeviceWs,

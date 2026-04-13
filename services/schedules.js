@@ -1,4 +1,5 @@
-const { sql, poolPromise } = require("../SQL/sqlSetup");
+const { getDb, nextId } = require("../DB/mongo");
+const { cleanDocs } = require("./mongoData");
 
 async function createSchedule({
   homeId,
@@ -10,37 +11,37 @@ async function createSchedule({
   timezone,
   createdBy,
 }) {
-  const db = await poolPromise;
-  await db
-    .request()
-    .input("h", sql.Int, homeId)
-    .input("d", sql.Int, devicePk)
-    .input("s", sql.Int, scenePk)
-    .input("a", sql.NVarChar, actionJson)
-    .input("r", sql.VarChar, rrule)
-    .input("c", sql.VarChar, cron)
-    .input("tz", sql.VarChar, timezone)
-    .input("u", sql.Int, createdBy).query(`
-      INSERT INTO Schedules(home_id, device_id, scene_id, action, rrule, cron, timezone, created_by)
-      VALUES(@h,@d,@s,@a,@r,@c,@tz,@u)
-    `);
+  const db = await getDb();
+  await db.collection("schedules").insertOne({
+    id: await nextId("schedules"),
+    home_id: Number(homeId),
+    device_id: devicePk == null ? null : Number(devicePk),
+    scene_id: scenePk == null ? null : Number(scenePk),
+    action: actionJson,
+    rrule,
+    cron,
+    timezone,
+    created_by: Number(createdBy),
+    is_active: true,
+    created_at: new Date(),
+  });
 }
 
 async function listActiveSchedules() {
-  const db = await poolPromise;
-  const r = await db
-    .request()
-    .query("SELECT * FROM Schedules WHERE is_active=1");
-  return r.recordset;
+  const db = await getDb();
+  return cleanDocs(
+    await db
+      .collection("schedules")
+      .find({ is_active: true }, { projection: { _id: 0 } })
+      .toArray()
+  );
 }
 
 async function toggleSchedule(id, active) {
-  const db = await poolPromise;
+  const db = await getDb();
   await db
-    .request()
-    .input("id", sql.Int, id)
-    .input("a", sql.Bit, active ? 1 : 0)
-    .query("UPDATE Schedules SET is_active=@a WHERE id=@id");
+    .collection("schedules")
+    .updateOne({ id: Number(id) }, { $set: { is_active: !!active } });
 }
 
 module.exports = { createSchedule, listActiveSchedules, toggleSchedule };

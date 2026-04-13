@@ -1,88 +1,113 @@
-const { sql, poolPromise } = require("../SQL/sqlSetup");
+const { getDb, nextId } = require("../DB/mongo");
+const { cleanDoc, cleanDocs, pick } = require("./mongoData");
 
 async function getDeviceByPublicId(device_id) {
-  const db = await poolPromise;
-  const r = await db
-    .request()
-    .input("d", sql.VarChar, device_id)
-    .query(
-      "SELECT id, device_id, device_secret, home_id, room_id, name, type FROM Devices WHERE device_id=@d"
-    );
-  return r.recordset[0] || null;
+  const db = await getDb();
+  const device = await db.collection("devices").findOne(
+    { device_id },
+    {
+      projection: {
+        _id: 0,
+        id: 1,
+        device_id: 1,
+        device_secret: 1,
+        home_id: 1,
+        room_id: 1,
+        name: 1,
+        type: 1,
+      },
+    }
+  );
+  return cleanDoc(device);
 }
 
 async function getDeviceByPk(id) {
-  const db = await poolPromise;
-  const r = await db
-    .request()
-    .input("id", sql.Int, id)
-    .query(
-      "SELECT id, device_id, device_secret, home_id, room_id, name, type FROM Devices WHERE id=@id"
-    );
-  return r.recordset[0] || null;
+  const db = await getDb();
+  const device = await db.collection("devices").findOne(
+    { id: Number(id) },
+    {
+      projection: {
+        _id: 0,
+        id: 1,
+        device_id: 1,
+        device_secret: 1,
+        home_id: 1,
+        room_id: 1,
+        name: 1,
+        type: 1,
+      },
+    }
+  );
+  return cleanDoc(device);
 }
 
 async function listDevicesByHome(homeId) {
-  const db = await poolPromise;
-  const r = await db
-    .request()
-    .input("h", sql.Int, homeId)
-    .query(
-      "SELECT id, device_id, name, type, room_id, is_active FROM Devices WHERE home_id=@h ORDER BY id DESC"
-    );
-  return r.recordset;
+  const db = await getDb();
+  const devices = await db
+    .collection("devices")
+    .find({ home_id: Number(homeId) }, { projection: { _id: 0 } })
+    .sort({ id: -1 })
+    .toArray();
+  return cleanDocs(devices).map((device) =>
+    pick(device, ["id", "device_id", "name", "type", "room_id", "is_active"])
+  );
 }
 
-/** Optional online/offline markers – if you want a column, add it; here we just no-op */
-async function markDeviceOnline(/* devicePk */) {
+async function markDeviceOnline() {
   return true;
 }
-async function markDeviceOffline(/* devicePk */) {
+
+async function markDeviceOffline() {
   return true;
 }
 
 async function saveShadow(devicePk, reportedStateJson) {
-  const db = await poolPromise;
-  await db
-    .request()
-    .input("id", sql.Int, devicePk)
-    .input("rs", sql.NVarChar, reportedStateJson).query(`
-      MERGE DeviceShadows AS t
-      USING (SELECT @id AS device_id) s ON (t.device_id=s.device_id)
-      WHEN MATCHED THEN UPDATE SET reported_state=@rs, updated_at=SYSUTCDATETIME()
-      WHEN NOT MATCHED THEN INSERT(device_id, reported_state) VALUES(@id, @rs);
-    `);
+  const db = await getDb();
+  await db.collection("deviceShadows").updateOne(
+    { device_id: Number(devicePk) },
+    {
+      $set: {
+        reported_state: reportedStateJson,
+        updated_at: new Date(),
+      },
+      $setOnInsert: { device_id: Number(devicePk) },
+    },
+    { upsert: true }
+  );
 }
 
 async function fetchPending(devicePk) {
-  const db = await poolPromise;
-  const r = await db.request().input("d", sql.Int, devicePk).query(`
-      SELECT TOP (50) id, payload
-      FROM PendingCommands
-      WHERE device_id=@d AND expire_at > SYSUTCDATETIME()
-      ORDER BY created_at ASC
-    `);
-  return r.recordset;
+  const db = await getDb();
+  return cleanDocs(
+    await db
+      .collection("pendingCommands")
+      .find(
+        {
+          device_id: Number(devicePk),
+          expire_at: { $gt: new Date() },
+        },
+        { projection: { _id: 0, id: 1, payload: 1 } }
+      )
+      .sort({ created_at: 1 })
+      .limit(50)
+      .toArray()
+  );
 }
 
 async function deletePending(id) {
-  const db = await poolPromise;
-  await db
-    .request()
-    .input("id", sql.BigInt, id)
-    .query("DELETE FROM PendingCommands WHERE id=@id");
+  const db = await getDb();
+  await db.collection("pendingCommands").deleteOne({ id: Number(id) });
 }
 
-async function enqueuePending(devicePk, payload, expireAt) {
-  const db = await poolPromise;
-  await db
-    .request()
-    .input("d", sql.Int, devicePk)
-    .input("p", sql.NVarChar, payload)
-    .input("x", sql.DateTime2, expireAt)
-    .query(
-      "INSERT INTO PendingCommands(device_id, payload, expire_at) VALUES(@d,@p,@x)"
-    );
+async function enqueuePending(devicePk, payload, expireAt = null) {
+  const db = await getDb();
+  await db.collection("pendingCommands").insertOne({
+    id: await nextId("pendingCommands"),
+    device_id: Number(devicePk),
+    payload,
+    expire_at: expireAt || new Date(Date.now() + 10 * 60 * 1000),
+    created_at: new Date(),
+  });
 }
 
 module.exports = {

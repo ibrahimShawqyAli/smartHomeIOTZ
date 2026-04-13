@@ -4,6 +4,7 @@ require("dotenv").config();
 const express = require("express");
 const http = require("http");
 const cors = require("cors");
+const { connectMongo } = require("./DB/mongo");
 
 // REST routes
 const membersRoutes = require("./API/members");
@@ -40,7 +41,7 @@ app.use(meRoutes);
 
 // Centralized duplicate-key guard + fallback
 app.use((err, _req, res, _next) => {
-  if (err && (err.number === 2627 || err.number === 2601)) {
+  if (err && (err.number === 2627 || err.number === 2601 || err.code === 11000)) {
     return res.status(409).json({ message: "Duplicate key" });
   }
   console.error("Unhandled error:", err);
@@ -58,11 +59,16 @@ server.on("upgrade", (req) => {
   console.log("UPGRADE", req.url, req.headers.upgrade, req.headers.connection);
 });
 
-// ---- Background jobs ----
-startSchedulePolling();
-
 // ---- Listen ----
 const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => {
-  console.log(`HTTP + WebSocket on :${PORT}`);
-});
+connectMongo()
+  .then(() => {
+    startSchedulePolling();
+    server.listen(PORT, () => {
+      console.log(`HTTP + WebSocket on :${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error("MongoDB connection failed:", err);
+    process.exit(1);
+  });

@@ -1,139 +1,142 @@
 const express = require("express");
-const { sql, poolPromise } = require("../SQL/sqlSetup");
+const { getDb } = require("../DB/mongo");
 const requireAuth = require("../middleware/requireAuth");
 const { sendControlToDevice } = require("../services/sender");
+const {
+  canAccessRoom,
+  isManager,
+  listVisibleDevices,
+  mergeMetaStatus,
+  pick,
+  userRole,
+} = require("../services/mongoData");
 
 const router = express.Router();
 
-/** Claim device (unchanged semantics) */
 router.post("/claim", requireAuth, async (req, res) => {
   const { device_id, device_secret, home_id, name, icon_path } = req.body;
-  const db = await poolPromise;
 
-  const m = await db
-    .request()
-    .input("h", sql.Int, home_id)
-    .input("u", sql.Int, req.user.id)
-    .query("SELECT role FROM HomeMembers WHERE home_id=@h AND user_id=@u");
-  if (!m.recordset[0]) return res.status(403).json({ message: "not in home" });
+  try {
+    const db = await getDb();
+    const role = await userRole(home_id, req.user.id);
+    if (!role) return res.status(403).json({ message: "not in home" });
 
-  const r = await db
-    .request()
-    .input("d", sql.VarChar, device_id)
-    .query("SELECT id, device_secret, home_id FROM Devices WHERE device_id=@d");
-  const row = r.recordset[0];
-  if (!row)
-    return res.status(404).json({ message: "device not connected yet" });
-  if (row.home_id && row.home_id !== home_id)
-    return res.status(409).json({ message: "device already claimed" });
-  if (row.device_secret !== device_secret)
-    return res.status(403).json({ message: "secret mismatch" });
+    const row = await db
+      .collection("devices")
+      .find({ device_id }, { projection: { _id: 0 } })
+      .sort({ id: 1 })
+      .limit(1)
+      .next();
 
-  await db
-    .request()
-    .input("id", sql.Int, row.id)
-    .input("h", sql.Int, home_id)
-    .input("n", sql.VarChar, name || device_id)
-    .input("i", sql.NVarChar, icon_path || "assets/images/lights.png")
-    .query(
-      "  UPDATE Devices SET home_id=@h, name=@n,  icon_path=@i,  meta=JSON_MODIFY(COALESCE(meta,'{}'), '$.status','claimed')  WHERE id=@id"
+    if (!row) {
+      return res.status(404).json({ message: "device not connected yet" });
+    }
+    if (row.home_id && row.home_id !== Number(home_id)) {
+      return res.status(409).json({ message: "device already claimed" });
+    }
+    if (row.device_secret !== device_secret) {
+      return res.status(403).json({ message: "secret mismatch" });
+    }
+
+    await db.collection("devices").updateOne(
+      { id: row.id },
+      {
+        $set: {
+          home_id: Number(home_id),
+          name: name || device_id,
+          icon_path: icon_path || "assets/images/lights.png",
+          meta: mergeMetaStatus(row.meta, "claimed"),
+        },
+      }
     );
 
-  res.json({ ok: true, devicePk: row.id });
-});
-
-/** List devices – visibility inherits room privacy */
-router.get("/home/:homeId", requireAuth, async (req, res) => {
-  const hid = parseInt(req.params.homeId, 10);
-  const db = await poolPromise;
-
-  const m = await db
-    .request()
-    .input("h", sql.Int, hid)
-    .input("u", sql.Int, req.user.id)
-    .query("SELECT role FROM HomeMembers WHERE home_id=@h AND user_id=@u");
-  const role = m.recordset[0]?.role;
-  if (!role) return res.status(403).json({ message: "not in home" });
-
-  if (role === "owner" || role === "admin") {
-    const r = await db.request().input("h", sql.Int, hid).query(`
-      SELECT d.id, d.device_id, d.name, d.type, d.room_id, d.meta, d.is_active, r.is_private
-      FROM Devices d
-      LEFT JOIN Rooms r ON r.id = d.room_id
-      WHERE d.home_id=@h
-      ORDER BY d.id DESC
-    `);
-    return res.json(r.recordset);
+    return res.json({ ok: true, devicePk: row.id });
+  } catch (err) {
+    console.error("claim device error:", err);
+    return res.status(500).json({ message: "internal error" });
   }
-
-  const r = await db
-    .request()
-    .input("h", sql.Int, hid)
-    .input("u", sql.Int, req.user.id).query(`
-    SELECT d.id, d.device_id, d.name, d.type, d.room_id, d.meta, d.is_active
-    FROM Devices d
-    LEFT JOIN Rooms r ON r.id = d.room_id
-    WHERE d.home_id=@h
-      AND (
-        r.id IS NULL              -- no room = public
-        OR r.is_private=0         -- public room
-        OR r.created_by=@u        -- private but I'm creator
-        OR EXISTS (SELECT 1 FROM HomeRoomAccess a
-                   WHERE a.home_id=@h AND a.user_id=@u AND a.room_id=r.id)
-      )
-    ORDER BY d.id DESC
-  `);
-  res.json(r.recordset);
 });
 
-/** Control device – enforce room privacy for non-managers */
+router.get("/home/:homeId", requireAuth, async (req, res) => {
+  const hid = Number(req.params.homeId);
+
+  try {
+    const db = await getDb();
+    const role = await userRole(hid, req.user.id);
+    if (!role) return res.status(403).json({ message: "not in home" });
+
+    const devices = await listVisibleDevices(hid, req.user.id, role);
+    const fields = [
+      "id",
+      "device_id",
+      "name",
+      "type",
+      "room_id",
+      "meta",
+      "is_active",
+    ];
+
+    if (!isManager(role)) {
+      return res.json(devices.map((device) => pick(device, fields)));
+    }
+
+    const roomIds = [...new Set(devices.map((d) => d.room_id).filter(Boolean))];
+    const rooms = await db
+      .collection("rooms")
+      .find(
+        { id: { $in: roomIds } },
+        { projection: { _id: 0, id: 1, is_private: 1 } }
+      )
+      .toArray();
+    const privacyByRoom = new Map(
+      rooms.map((room) => [room.id, room.is_private])
+    );
+
+    return res.json(
+      devices.map((device) => ({
+        ...pick(device, fields),
+        is_private: privacyByRoom.get(device.room_id),
+      }))
+    );
+  } catch (err) {
+    console.error("list devices error:", err);
+    return res.status(500).json({ message: "internal error" });
+  }
+});
+
 router.post("/:devicePk/control", requireAuth, async (req, res) => {
   const devicePk = Number(req.params.devicePk);
   const payload = req.body;
 
-  const db = await poolPromise;
-  const dev = await db
-    .request()
-    .input("id", sql.Int, devicePk)
-    .query("SELECT home_id, room_id FROM Devices WHERE id=@id");
-  if (!dev.recordset[0])
-    return res.status(404).json({ message: "device not found" });
-  const { home_id: hid, room_id } = dev.recordset[0];
+  try {
+    const db = await getDb();
+    const dev = await db.collection("devices").findOne(
+      { id: devicePk },
+      { projection: { _id: 0, home_id: 1, room_id: 1 } }
+    );
+    if (!dev) return res.status(404).json({ message: "device not found" });
 
-  const m = await db
-    .request()
-    .input("h", sql.Int, hid)
-    .input("u", sql.Int, req.user.id)
-    .query("SELECT role FROM HomeMembers WHERE home_id=@h AND user_id=@u");
-  const role = m.recordset[0]?.role;
-  if (!role) return res.status(403).json({ message: "not in home" });
+    const role = await userRole(dev.home_id, req.user.id);
+    if (!role) return res.status(403).json({ message: "not in home" });
 
-  if (!(role === "owner" || role === "admin")) {
-    if (room_id) {
-      const allowed = await db
-        .request()
-        .input("h", sql.Int, hid)
-        .input("u", sql.Int, req.user.id)
-        .input("r", sql.Int, room_id).query(`
-          SELECT 1
-          FROM Rooms r
-          WHERE r.id=@r AND r.home_id=@h
-            AND (
-              r.is_private=0
-              OR r.created_by=@u
-              OR EXISTS (SELECT 1 FROM HomeRoomAccess a
-                         WHERE a.home_id=@h AND a.user_id=@u AND a.room_id=@r)
-            )
-        `);
-      if (!allowed.recordset[0])
-        return res
-          .status(403)
-          .json({ message: "no permission for this room/device" });
+    const allowed = await canAccessRoom(
+      dev.home_id,
+      dev.room_id,
+      req.user.id,
+      role
+    );
+    if (!allowed) {
+      return res
+        .status(403)
+        .json({ message: "no permission for this room/device" });
     }
-  }
 
-  await sendControlToDevice({ devicePk, payload, issuedBy: req.user.id });
-  res.json({ status: true });
+    await sendControlToDevice({ devicePk, payload, issuedBy: req.user.id });
+    return res.json({ status: true });
+  } catch (err) {
+    console.error("control device error:", err);
+    return res.status(500).json({ message: "internal error" });
+  }
 });
 
 module.exports = router;
